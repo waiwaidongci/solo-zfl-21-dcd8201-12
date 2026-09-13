@@ -1,0 +1,14 @@
+{
+  "name": "clock-escapement-tuning-api",
+  "version": "1.1.0",
+  "description": "机械钟表擒纵调校 API：鉴证、证书签发/撤销与所有权流转（哈希链持久化）",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

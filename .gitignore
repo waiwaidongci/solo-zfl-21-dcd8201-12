@@ -18,3 +18,5 @@ coverage/
 .vscode/
 
 *.log
+data/chain.log
+data/*.tmp.*
