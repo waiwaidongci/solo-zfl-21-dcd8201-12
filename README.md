@@ -12,9 +12,12 @@
 
 ```bash
 node server.js                 # 默认 PORT=3021，DATA_DIR=./data
-npm test                       # node --test test/，22 个用例
+npm test                       # node --test test/service.test.js，26 个用例
 ALLOW_CLOCK_OVERRIDE=1 node server.js   # 允许 x-now 注入时间（仅测试用）
 ```
+
+> 写接口请求体必须是 JSON 对象：空请求体、`null`、数组、字符串、数字、布尔或非法 JSON
+> 一律返回 `400 INVALID_BODY`/`INVALID_JSON`，不会写入链路或转让记录。
 
 ## 角色
 

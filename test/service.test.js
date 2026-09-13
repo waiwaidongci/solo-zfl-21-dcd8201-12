@@ -47,14 +47,21 @@ async function stopServer() {
   }
 }
 
-async function request(method, urlPath, { body, headers = {}, now } = {}) {
+async function request(method, urlPath, { body, raw, headers = {}, now } = {}) {
   const allHeaders = { ...headers };
-  if (body !== undefined) allHeaders["Content-Type"] = "application/json";
+  let payload;
+  if (raw !== undefined) {
+    payload = raw;
+    if (raw !== "") allHeaders["Content-Type"] = "application/json";
+  } else if (body !== undefined) {
+    allHeaders["Content-Type"] = "application/json";
+    payload = JSON.stringify(body);
+  }
   if (now) allHeaders["x-now"] = now;
   const res = await fetch(`${baseUrl}${urlPath}`, {
     method,
     headers: allHeaders,
-    body: body === undefined ? undefined : JSON.stringify(body)
+    body: payload
   });
   const text = await res.text();
   let json = null;
@@ -885,3 +892,134 @@ test("安全：生产配置（未开启时间注入）下 x-now 头被拒绝", a
   await prod.close();
   await fs.rm(prodDir, { recursive: true, force: true });
 });
+
+/* -------------------------------------------------------------------------- */
+/* 9. 回归：null/空体/非对象请求体                                             */
+/* -------------------------------------------------------------------------- */
+
+test("回归：鉴证登记、复核、撤销、发起转让收到坏请求体一律400，且不写链路/转让", async () => {
+  const clockId = await createClock("badbody");
+
+  const badPayloads = [
+    { label: "空请求体", raw: "" },
+    { label: "null", raw: "null" },
+    { label: "数组", raw: "[]" },
+    { label: "字符串", raw: '"abc"' },
+    { label: "数字", raw: "42" },
+    { label: "布尔", raw: "true" },
+    { label: "非法JSON", raw: "{oops" }
+  ];
+
+  const endpoints = [
+    {
+      name: "鉴证登记",
+      path: `/clocks/${clockId}/appraisals`,
+      headers: ACT.appraiser("app1")
+    },
+    {
+      name: "复核",
+      path: "/appraisals/appraisal_nonexistent/review",
+      headers: ACT.reviewer("rev1")
+    },
+    {
+      name: "撤销",
+      path: "/certificates/CERT-NONE/revoke",
+      headers: ACT.reviewer("rev1")
+    },
+    {
+      name: "发起转让",
+      path: `/clocks/${clockId}/transfers`,
+      headers: ACT.holder("alice")
+    }
+  ];
+
+  for (const ep of endpoints) {
+    for (const payload of badPayloads) {
+      const res = await request("POST", ep.path, { headers: ep.headers, raw: payload.raw });
+      assert.equal(
+        res.status,
+        400,
+        `${ep.name} 对「${payload.label}」应返回400，实际 ${res.status}: ${JSON.stringify(res.body)}`
+      );
+      assert.ok(
+        ["INVALID_BODY", "INVALID_JSON"].includes(res.body.code),
+        `${ep.name} 对「${payload.label}」错误码应为 INVALID_BODY/INVALID_JSON，实际 ${res.body.code}`
+      );
+    }
+  }
+
+  // 所有坏请求都被挡在落盘之前：链路为空、无任何鉴证/证书/转让
+  const records = await readChain();
+  assert.equal(records.length, 0);
+  const transfers = await request("GET", "/transfers");
+  assert.equal(transfers.body.data.length, 0);
+  const certs = await request("GET", "/certificates");
+  assert.equal(certs.body.data.length, 0);
+  const appraisals = await request("GET", `/clocks/${clockId}/appraisals`);
+  assert.equal(appraisals.body.data.length, 0);
+});
+
+test("回归：坏请求之后完整成功流程（鉴证→签发→转让→接受）与并发互斥仍正常", async () => {
+  const clockId = await createClock("badafter");
+
+  // 先制造一批坏请求
+  for (const raw of ["", "null", "[]", "42", "{x"]) {
+    await request("POST", `/clocks/${clockId}/appraisals`, { headers: ACT.appraiser("app1"), raw });
+  }
+
+  // 完整成功流程
+  const reg = await request("POST", `/clocks/${clockId}/appraisals`, {
+    headers: ACT.appraiser("app1"),
+    body: { authenticity: "genuine", condition: "mint", estimatedValue: 50000, evidence: "docs" }
+  });
+  assert.equal(reg.status, 201, JSON.stringify(reg.body));
+
+  const rev = await request("POST", `/appraisals/${reg.body.data.id}/review`, {
+    headers: ACT.reviewer("rev1"),
+    body: { decision: "approve", ownerId: "alice" }
+  });
+  assert.equal(rev.status, 200);
+  const serial = rev.body.data.certificate.serial;
+
+  // 撤销入口的空体被 400 拒绝，证书仍然有效（失败不改变状态）
+  const emptyRevoke = await request("POST", `/certificates/${serial}/revoke`, {
+    headers: ACT.reviewer("rev1"),
+    raw: ""
+  });
+  assert.equal(emptyRevoke.status, 400);
+  const stillValid = await request("GET", `/certificates?clockId=${clockId}&status=valid`);
+  assert.equal(stillValid.body.data.length, 1);
+
+  const prop = await request("POST", `/clocks/${clockId}/transfers`, {
+    headers: ACT.holder("alice"),
+    body: { toOwnerId: "bob" }
+  });
+  assert.equal(prop.status, 201);
+  const transferId = prop.body.data.id;
+
+  // 空接受体此前为合法（{}）；真正空体现在按 400 拒绝，且转让仍停留在 pending
+  const emptyAccept = await request("POST", `/transfers/${transferId}/accept`, {
+    headers: ACT.holder("bob"),
+    raw: ""
+  });
+  assert.equal(emptyAccept.status, 400);
+
+  // 并发接受仍恰好一笔成功
+  const results = await Promise.all(
+    Array.from({ length: 6 }, () =>
+      request("POST", `/transfers/${transferId}/accept`, { headers: ACT.holder("bob"), body: {} })
+    )
+  );
+  assert.equal(results.filter((r) => r.status === 200).length, 1);
+
+  const own = await request("GET", `/clocks/${clockId}/ownership`);
+  assert.equal(own.body.data.current.ownerId, "bob");
+
+  // 链上恰为 registered/approved/proposed/accepted 四个事件，坏请求无一落链
+  const records = await readChain();
+  assert.deepEqual(
+    records.map((r) => r.event.type),
+    ["appraisal.registered", "appraisal.approved", "transfer.proposed", "transfer.accepted"]
+  );
+});
+

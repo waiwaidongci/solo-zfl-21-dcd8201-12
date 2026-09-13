@@ -103,6 +103,9 @@ class HttpError extends Error {
 }
 
 function required(body, fields) {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new HttpError(400, "请求体必须是 JSON 对象", "INVALID_BODY");
+  }
   const missing = fields.filter((field) => body[field] === undefined || body[field] === "");
   if (missing.length) throw new HttpError(400, `缺少字段：${missing.join(", ")}`, "MISSING_FIELDS");
 }
@@ -801,12 +804,20 @@ function send(res, status, body) {
 async function parseBody(req) {
   let raw = "";
   for await (const chunk of req) raw += chunk;
-  if (!raw) return {};
+  if (!raw.trim()) {
+    throw new HttpError(400, "请求体不能为空，必须是 JSON 对象", "INVALID_BODY");
+  }
+  let value;
   try {
-    return JSON.parse(raw);
+    value = JSON.parse(raw);
   } catch {
     throw new HttpError(400, "请求体必须是合法JSON", "INVALID_JSON");
   }
+  // null、数组、字符串、数字、布尔都不是合法的请求体
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError(400, "请求体必须是 JSON 对象", "INVALID_BODY");
+  }
+  return value;
 }
 
 /** 三类角色身份从请求头带入：x-actor-id + x-actor-role，各环节只认对应角色 */
